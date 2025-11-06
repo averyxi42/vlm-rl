@@ -189,149 +189,103 @@ class LVLMActorCriticPolicy(ActorCriticPolicy):
         action_space: spaces.Discrete,
         lr_schedule: Callable[[float], float],
         model_name: str= "google/gemma-3-4b-it",
-        use_lora: bool = True,
-        use_4bit: bool = False,
+        lora_config = None,
         exploration_temperature = 7,
-        device="auto",
         model_kwargs = {},
         processor_kwargs={},
+        detach_value_head = True,
+        use_policy_head = False,
+        policy_token_idx = -1,#position of the action latents in the sequence, typically last token of prompt
+        value_token_idx = -1, #position of the value latents in the sequence, can be a special token after prompt
         **kwargs,
     ):
         # Disable the default MLP extractor; the LVLM is our network.
         kwargs["net_arch"] = []
         super().__init__(observation_space, action_space, lr_schedule, **kwargs)
 
-        # --- 1. Load LVLM with Quantization and LoRA for efficiency ---
-        # quantization_config = BitsAndBytesConfig(load_in_4bit=True) if use_4bit else None
-        
+        # --- 1. Load LVLM  ---
         self.lvlm = AutoModelForImageTextToText.from_pretrained(
             model_name,
-            # quantization_config=quantization_config,
             torch_dtype=torch.bfloat16, # Recommended for modern models
             **model_kwargs
-
-          # Handles device placement
         )
         self.exploration_temperature = exploration_temperature
-        if use_lora:
-            # A standard LoRA configuration
-            lora_config = LoraConfig(
-                r=128,
-                lora_alpha=256,
-                lora_dropout=0.05,
-                target_modules=".*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*",
-                task_type="CAUSAL_LM",
-            )
+        self.detach_value_head = detach_value_head
+        self.policy_idx = policy_token_idx
+        self.value_idx = value_token_idx
+        # --- 2. Add Lora
+        if lora_config is not None:
             self.lvlm = get_peft_model(self.lvlm, lora_config)
             print("LoRA enabled. Trainable parameters:")
             self.lvlm.print_trainable_parameters()
-
+        else:
+            print("no Lora Config Provided, freezing LVLM")
+            for parameter in self.lvlm.parameters():
+                parameter.requires_grad = False
         # --- 2. Define the separate Value Head ---
         # The value is estimated from the LVLM's final hidden state.
         # self.value_net = nn.Linear(self.lvlm.config.text_config.hidden_size, 1,dtype=torch.bfloat16)
         hidden_size = self.lvlm.config.text_config.hidden_size
-        VALUE_NET_DTYPE = torch.float32
+        HEAD_DTYPE = torch.float32
         self.value_net = nn.Sequential(
             # 1. LayerNorm to stabilize the input from the LVLM
-            nn.LayerNorm(hidden_size,dtype=VALUE_NET_DTYPE),
-            
+            nn.LayerNorm(hidden_size,dtype=HEAD_DTYPE),
             # 2. A deeper MLP to increase capacity
-            nn.Linear(hidden_size, 256,dtype=VALUE_NET_DTYPE),
+            nn.Linear(hidden_size, 256,dtype=HEAD_DTYPE),
             nn.ReLU(),
-            nn.Linear(256, 256,dtype=VALUE_NET_DTYPE),
+            nn.Linear(256, 256,dtype=HEAD_DTYPE),
             nn.ReLU(),
-            nn.Linear(256, 1,dtype=VALUE_NET_DTYPE)
+            nn.Linear(256, 1,dtype=HEAD_DTYPE)
         )
-
         last_layer = self.value_net[-1]
         torch.nn.init.constant_(last_layer.weight, 0)
         torch.nn.init.constant_(last_layer.bias, 0)
-        # --- 3. Pre-calculate action token IDs ---
-        # This is a critical optimization for action selection.
-        tokenizer = AutoProcessor.from_pretrained(model_name,**processor_kwargs).tokenizer
-        self.action_token_ids = []
-        for i in range(self.action_space.n):
-            # We only use the first token if a number is multi-token (e.g., '10').
-            # The prompt design should enforce single-digit responses.
-            token_id = tokenizer(str(i), add_special_tokens=False).input_ids[0]
-            self.action_token_ids.append(token_id)
-        
-        # Register as a buffer to ensure it's moved to the correct device
-        self.register_buffer(
-            'action_token_ids_tensor', 
-            torch.tensor(self.action_token_ids, dtype=torch.long)
-        )
+
+        if use_policy_head:
+            self.policy_net = nn.Sequential(
+            # 1. LayerNorm to stabilize the input from the LVLM
+            nn.LayerNorm(hidden_size,dtype=HEAD_DTYPE),
+            # 2. A deeper MLP to increase capacity
+            nn.Linear(hidden_size, 256,dtype=HEAD_DTYPE),
+            nn.ReLU(),
+            nn.Linear(256, 256,dtype=HEAD_DTYPE),
+            nn.ReLU(),
+            nn.Linear(256, self.action_space.n,dtype=HEAD_DTYPE)
+            )
+            self._get_action_dist = self._get_action_dist_from_head
+        else:
+            # --- 3. Pre-calculate action token IDs ---
+            # This is a critical optimization for action selection.
+            tokenizer = AutoProcessor.from_pretrained(model_name,**processor_kwargs).tokenizer
+            self.action_token_ids = []
+            for i in range(self.action_space.n):
+                # We only use the first token if a number is multi-token (e.g., '10').
+                # The prompt design should enforce single-digit responses.
+                token_id = tokenizer(str(i), add_special_tokens=False).input_ids[0]
+                self.action_token_ids.append(token_id)
+            
+            # Register as a buffer to ensure it's moved to the correct device
+            self.register_buffer(
+                'action_token_ids_tensor', 
+                torch.tensor(self.action_token_ids, dtype=torch.long)
+            )
+
+            self._get_action_dist = self._get_action_dist_from_tokens
         # self.to(device)
-    def _build(self, lr_schedule) -> None:
-        """
-        Create the networks and the optimizer.
-
-        :param lr_schedule: Learning rate schedule
-            lr_schedule(1) is the initial learning rate
-        """
-        param_groups = [
-            {"params": self.lvlm.parameters(), "lr": 1e-6},  # frozen or tiny lr
-            # {"params": self.policy_head.parameters(), "lr": 3e-4},  # policy lr
-            {"params": self.value_net.parameters(), "lr": 1e-3},   # **higher LR**
-        ]
-        self.optimizer = self.optimizer_class(param_groups, lr=lr_schedule(1), **self.optimizer_kwargs)  # type: ignore[call-arg]
-
-    def forward(
-        self, 
-        obs: torch.Tensor, 
-        deterministic: bool = False,
-        **kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        The forward pass of the policy.
-        
-        SB3 automatically handles batching and moving the `obs` dictionary's
-        tensors to the correct device.
-        """
-        # The observation from the VecEnv is already a dictionary of batched tensors.
-        # We also need to squeeze the extra dimension from the wrapper.
-        obs = self._prepare_model_input(obs)
-
-        model_input = obs#{k: v for k, v in obs.items()} #.squeeze(1)
-        # for k,v in model_input.items():
-        #     print(f"{k}:{v.shape},{v.dtype}")
-        # Forward pass through the LVLM
-        # We need hidden states for the value function.
-        outputs = self.lvlm(**model_input, output_hidden_states=True)
-
-        # --- Actor Logic ---
-        # Policy logits are the logits for the *last* token in the sequence.
-        latent_pi = outputs.logits[:, -1, :]
-        
-        # --- Critic Logic ---
-        # Value is derived from the *last* hidden state of the final layer.
-        # The hidden_states tuple contains one tensor per layer.
-        latent_vf = outputs.hidden_states[-1][:, -1, :].detach()
-
-        # This part is standard SB3: evaluate actions and get value
-        value = self.value_net(latent_vf)
-        action_distribution = self._get_action_dist_from_latent(latent_pi)
-        # print(action_distribution.distribution)
-        actions = action_distribution.get_actions(deterministic=deterministic)
-        log_prob = action_distribution.log_prob(actions)
-
-        return actions, value.float(), log_prob.float()
-    # def _prepare_model_input(self, obs: torch.Tensor) -> Dict[str, torch.Tensor]:
+    # def _build(self, lr_schedule) -> None:
     #     """
-    #     A helper function to prepare the observation dictionary for the LVLM.
-    #     This is where we will enforce the correct dtypes.
+    #     Create the networks and the optimizer.
+
+    #     :param lr_schedule: Learning rate schedule
+    #         lr_schedule(1) is the initial learning rate
     #     """
-    #     # Squeeze the wrapper's extra dimension
-    #     model_input = {k: v.squeeze(1) for k, v in obs.items()}
-        
-    #     # --- THE FIX ---
-    #     # Ensure 'input_ids' is always a LongTensor before passing to the model.
-    #     # The embedding layer requires integer indices.
-    #     if 'input_ids' in model_input:
-    #         model_input['input_ids'] = model_input['input_ids'].long()
-        
-    #     return model_input
-    
+    #     param_groups = [
+    #         {"params": self.lvlm.parameters(), "lr": 1e-6},  # frozen or tiny lr
+    #         {"params": self.value_net.parameters(), "lr": 3e-4},   # **higher LR**
+    #         {"params": self.policy_net.parameters(),"lr": 3e-4}
+    #     ]
+    #     self.optimizer = self.optimizer_class(param_groups, **self.optimizer_kwargs)  # type: ignore[call-arg]
+
     def _prepare_model_input(self, obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         Prepares the observation dictionary for the LVLM.
@@ -354,7 +308,7 @@ class LVLMActorCriticPolicy(ActorCriticPolicy):
                 target_dtype = torch.long
             elif np.issubdtype(correct_numpy_dtype, np.floating):
                 # All float types (pixel_values) should match the model's precision.
-                target_dtype = torch.float # Use the model's native dtype (e.g., bfloat16)
+                target_dtype = torch.bfloat16 # Use the model's native dtype (e.g., bfloat16)
             else:
                 # Should not happen with Box spaces, but we can skip if it does.
                 continue
@@ -364,6 +318,68 @@ class LVLMActorCriticPolicy(ActorCriticPolicy):
                 model_input[key] = tensor.to(target_dtype)
 
         return model_input
+
+    def _get_value(self,outputs):
+        # 3. Get the latent feature for the value function
+        latent_vf = outputs.hidden_states[-1][:, self.value_idx, :]
+        if self.detach_value_head:
+            latent_vf = latent_vf.detach() #prevents gradient backflow
+        return self.value_net(latent_vf.float())
+    def _get_action_dist_from_tokens(self,outputs):
+        """
+        Selects the action-specific logits from the LVLM's full vocabulary,
+        applies temperature scaling to encourage exploration, and casts to
+        float32 for numerical stability before creating the SB3 distribution.
+        
+        :param outputs: The raw model outputs.
+        :return: A Stable Baselines 3 CategoricalDistribution.
+        """
+        latent_pi = outputs.logits[:, self.policy_idx, :]
+        # 1. Select the logits corresponding to our discrete action tokens.
+        #    The output will have shape (batch_size, num_actions) and dtype bfloat16.
+        action_logits_bf16 = latent_pi[:, self.action_token_ids_tensor]
+        # 2. Apply temperature scaling to soften the distribution.
+        #    This is the core fix for the low-entropy problem.
+        # 3. Explicitly cast to float32.
+        #    This is a crucial step for ensuring compatibility and numerical
+        #    stability with the SB3 distribution and loss calculation.
+        final_action_logits =  action_logits_bf16.float() / self.exploration_temperature
+        # 4. Create the final probability distribution.
+        #    SB3's distribution class will handle the softmax operation internally.
+        return self.action_dist.proba_distribution(action_logits=final_action_logits)
+
+    def _get_action_dist_from_head(self,outputs):
+        latent_pi = outputs.hidden_states[-1][:, self.policy_idx, :]
+        action_logits = self.policy_net(latent_pi.float())
+        final_action_logits =  action_logits / self.exploration_temperature
+        return self.action_dist.proba_distribution(action_logits=final_action_logits)
+
+    def forward(
+        self, 
+        obs: torch.Tensor, 
+        deterministic: bool = False,
+        **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        The forward pass of the policy.
+        
+        SB3 automatically handles batching and moving the `obs` dictionary's
+        tensors to the correct device.
+        """
+        # The observation from the VecEnv is already a dictionary of batched tensors.
+        # We also need to squeeze the extra dimension from the wrapper.
+        model_inputs = self._prepare_model_input(obs)
+
+        outputs = self.lvlm(**model_inputs, output_hidden_states=True)
+
+        action_distribution = self._get_action_dist(outputs)
+        value = self._get_value(outputs)
+        # print(action_distribution.distribution)
+        actions = action_distribution.get_actions(deterministic=deterministic)
+        log_prob = action_distribution.log_prob(actions)
+
+        return actions, value.float(), log_prob.float()
+    
     def predict_values(self, obs: torch.Tensor) -> torch.Tensor:
         """
         Gets the value prediction from the critic part of the network.
@@ -373,59 +389,11 @@ class LVLMActorCriticPolicy(ActorCriticPolicy):
         :param obs: The observation dictionary.
         :return: The predicted value of the state.
         """
-        # We define the correct forward path to get the value,
-        # which is to go through the LVLM and then the value_net.
-        obs = self._prepare_model_input(obs)
+        model_inputs = self._prepare_model_input(obs)
         with torch.no_grad():
-            # 1. Prepare model input, same as in `forward()`
-            model_input = {k: v.squeeze(1) for k, v in obs.items()}
-            
-            # 2. Forward pass through the LVLM to get hidden states
-            outputs = self.lvlm(**model_input, output_hidden_states=True)
-            
-            # 3. Get the latent feature for the value function
-            latent_vf = outputs.hidden_states[-1][:, -1, :].detach()
-            
-            # 4. Pass it through our value head
-            return self.value_net(latent_vf).float()
-    # def _get_action_dist_from_latent(self, latent_pi: torch.Tensor):
-    #     """
-
-    #     Selects the logits corresponding to our discrete action tokens and
-    #     creates a categorical distribution.
-    #     """
-    #     # Select only the logits for our pre-calculated action tokens
-    #     action_logits = latent_pi[:, self.action_token_ids_tensor]
-
+            outputs = self.lvlm(**model_inputs, output_hidden_states=True)
+            return self._get_value(outputs)
         
-    #     return self.action_dist.proba_distribution(action_logits=action_logits)
-
-    def _get_action_dist_from_latent(self, latent_pi: torch.Tensor):
-        """
-        Selects the action-specific logits from the LVLM's full vocabulary,
-        applies temperature scaling to encourage exploration, and casts to
-        float32 for numerical stability before creating the SB3 distribution.
-        
-        :param latent_pi: The raw logits from the LVLM's final layer,
-                          shape (batch_size, vocab_size), dtype bfloat16.
-        :return: A Stable Baselines 3 CategoricalDistribution.
-        """
-        # 1. Select the logits corresponding to our discrete action tokens.
-        #    The output will have shape (batch_size, num_actions) and dtype bfloat16.
-        action_logits_bf16 = latent_pi[:, self.action_token_ids_tensor]
-        
-        # 2. Apply temperature scaling to soften the distribution.
-        #    This is the core fix for the low-entropy problem.
-        
-        # 3. Explicitly cast to float32.
-        #    This is a crucial step for ensuring compatibility and numerical
-        #    stability with the SB3 distribution and loss calculation.
-        final_action_logits =  action_logits_bf16.float() / self.exploration_temperature
-        
-        # 4. Create the final probability distribution.
-        #    SB3's distribution class will handle the softmax operation internally.
-        return self.action_dist.proba_distribution(action_logits=final_action_logits)
-
     def _predict(self, observation: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
         """
         Get the action from the policy given an observation.
@@ -441,23 +409,18 @@ class LVLMActorCriticPolicy(ActorCriticPolicy):
         """
         Standard SB3 method for evaluating actions during training.
         """
-        obs = self._prepare_model_input(obs)
         # for k,v in obs.items():
         #     print(f"{k}:{v.shape},{v.dtype}")
-        model_input = obs#{k: v.squeeze(1) for k, v in obs.items()} #how come .long works here??? makes no sense
+        model_input = self._prepare_model_input(obs)
         # for k,v in model_input.items():
         #     print(f"{k}:{v.shape},{v.dtype}")
-
         outputs = self.lvlm(**model_input, output_hidden_states=True)
-        
-        latent_pi = outputs.logits[:, -1, :]
-        latent_vf = outputs.hidden_states[-1][:, -1, :].detach()
-        
-        value = self.value_net(latent_vf)
-        action_distribution = self._get_action_dist_from_latent(latent_pi)
+
+        value = self._get_value(outputs)
+        action_distribution = self._get_action_dist(outputs)
+
         log_prob = action_distribution.log_prob(actions)
         entropy = action_distribution.entropy()
-
         return value.float(), log_prob.float(), entropy.float()
     
 class MacroActionWrapper(gym.Wrapper):

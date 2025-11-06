@@ -14,6 +14,7 @@ import numpy as np
 from typing import Any, Tuple, List, Dict
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from envs.car_racing import HumanRGBRacingEnv
+from envs.wrappers import FrameSkip
 
 if __name__=="__main__":
     print("--- Dependencies Installed ---")
@@ -132,44 +133,6 @@ if __name__=="__main__":
 
     print("--- Defining Advanced Frame Stacking Formatter ---")
 
-    class FrameSkip(gym.Wrapper):
-        """
-        A wrapper that repeats the same action for a specified number of frames
-        and returns the observation from the final frame.
-
-        :param env: The environment to wrap.
-        :param skip: The number of frames to skip for each action.
-        """
-        def __init__(self, env: gym.Env, skip: int = 4):
-            super().__init__(env)
-            if skip <= 0:
-                raise ValueError("Frame skip must be a positive integer.")
-            self.skip = skip
-
-        def step(self, action):
-            """
-            Repeat the action `skip` times, returning the AVERAGE reward.
-            """
-            total_reward = 0.0
-            steps_taken = 0
-            obs, reward, terminated, truncated, info = None,None,None,None,None
-            for i in range(self.skip):
-                obs, reward, terminated, truncated, info = self.env.step(action)
-                total_reward += reward
-                steps_taken += 1
-                
-                # If the episode ends mid-skip, we must stop and return immediately
-                if terminated or truncated:
-                    break
-            
-            # The crucial change: divide the total reward by the number of steps taken.
-            average_reward = total_reward / steps_taken
-            
-            return obs, average_reward, terminated, truncated, info
-
-        def reset(self, **kwargs):
-            """Resets the environment."""
-            return self.env.reset(**kwargs)
 
     # --- 5. Create the Final, Fully-Equipped Environment ---
     print("\n--- Creating the final, wrapped environment with frame stacking... ---")
@@ -260,6 +223,7 @@ if __name__=="__main__":
     N_EPOCHS = 1        # How many times to loop over the collected data
     LEARNING_RATE = 3e-6 # A smaller learning rate is often better for fine-tuning
     DEVICE='cuda:1'
+    DISABLE_LR_SCHEDULE = True
     torch.cuda.empty_cache()
     # --- 3. Instantiate the PPO Agent ---
     # We use the standard PPO class from Stable Baselines 3.
@@ -276,7 +240,7 @@ if __name__=="__main__":
         learning_rate=LEARNING_RATE,
         verbose=1,
         tensorboard_log=LOGDIR,
-        policy_kwargs={"exploration_temperature":1.0,'model_name':MODEL_NAME,"device":DEVICE},
+        policy_kwargs={"exploration_temperature":1.0,'model_name':MODEL_NAME},
         clip_range_vf=0.2, # Clip the value function update
         clip_range=0.2,    # Standard clipping for the policy
         max_grad_norm=1,
