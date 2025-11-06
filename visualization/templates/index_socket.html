@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Live RL Training Monitor (WebSocket)</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background-color: #121212; color: #e0e0e0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        h1 { color: #bb86fc; }
+        #live-image { border: 3px solid #03dac6; border-radius: 8px; background-color: #1e1e1e; object-fit: contain; max-width: 90%; max-height: 80vh; }
+    </style>
+    <!-- We need the Socket.IO client library -->
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+</head>
+<body>
+    <h1>Real-time Training Feed</h1>
+    <img id="live-image" alt="Waiting for first frame from server...">
+
+    <script>
+        document.addEventListener('DOMContentLoaded', (event) => {
+            // Connect to the WebSocket server
+            const socket = io();
+            const imageElement = document.getElementById('live-image');
+
+            socket.on('connect', () => {
+                console.log('Successfully connected to WebSocket server.');
+            });
+
+            // This is the event listener. It triggers whenever the server sends a 'new_frame' event.
+            socket.on('new_frame', (data) => {
+                // Update the image source with the Base64 encoded JPEG data.
+                // This is extremely fast and efficient.
+                imageElement.src = 'data:image/jpeg;base64,' + data.image;
+            });
+
+            socket.on('disconnect', () => {
+                console.log('Disconnected from WebSocket server.');
+            });
+        });
+    </script>
+</body>
+</html>

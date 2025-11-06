@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live RL Monitoring</title>
+</head>
+<body>
+    <h1>Live Environment Feed</h1>
+    <img id="render" src="/render" width="600">
+    <script>
+        setInterval(function() {
+            var myImageElement = document.getElementById('render');
+            myImageElement.src = '/render?rand=' + Math.random();
+        }, 100); // Refresh every 500ms
+    </script>
+</body>
+</html>
