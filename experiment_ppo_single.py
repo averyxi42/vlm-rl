@@ -79,8 +79,10 @@ def main():
     parser.add_argument("--config", required=True, help="Path to config Python module (no .py extension)")
     parser.add_argument("--project", required=True, help="Project name (used for log directory)")
     parser.add_argument("--device",required=False,default='cuda')
-    args = parser.parse_args()
 
+    args = parser.parse_args()
+    device = torch.device(args.device)
+    print(f"running on {torch.zeros(1,device=device).device}") #sanity check
     # Import config
     cfg = importlib.import_module(args.config.replace("/", ".").replace(".py", ""))
 
@@ -114,7 +116,7 @@ def main():
     cfg.modify_ppo(model)
         
     # Attach custom callbacks
-    checkpoint = CheckpointCallback(save_freq=cfg.save_freq, save_path=proj_dir, name_prefix="checkpoint")
+    checkpoint = CheckpointCallback(save_freq=cfg.save_freq, save_path=proj_dir, name_prefix="checkpoint",verbose=2)
     # stats = LVLMStatsCallback(proj_dir)
     liveview = SimpleRenderCallback(1,image_path=proj_dir,image_name="live_view.png")
 

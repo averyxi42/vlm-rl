@@ -2,3 +2,4 @@ logs/
 babyai/
 __pycache__/
 videos/
+runs/

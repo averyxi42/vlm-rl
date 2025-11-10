@@ -27,7 +27,6 @@ class HumanRGBRacingEnv(gym.Env):
     def _get_obs(self):
         # Get the RGB array from the underlying environment
         frame = self.internal_env.render()
-        
         # Resize to a standard dimension for CNNs
         resized_frame = cv2.resize(frame, self.img_shape[:2], interpolation=cv2.INTER_AREA)
         return resized_frame

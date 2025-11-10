@@ -74,8 +74,9 @@ class LLMProcessingWrapper(gym.ObservationWrapper):
                 shape=value.shape,
                 dtype=value.dtype
             )
-            print(f"  - Detected space '{key}': shape={value.shape}, dtype={value.dtype}")
-            
+            # print(f"  - Detected space '{key}': shape={value.shape}, dtype={value.dtype}")
+            # if key =='input_ids':
+            #     print(f"{key}: {self.processor.tokenizer.decode(value)}")
         return spaces.Dict(space_dict)
 
     # def _process_observation(self, obs: Any) -> dict[str, np.ndarray]:
