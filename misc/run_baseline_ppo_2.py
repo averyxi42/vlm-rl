@@ -42,10 +42,10 @@ if __name__ == "__main__":
 
     # --- Training Hyperparameters ---
     N_STEPS = 256             # Number of steps to collect per rollout
-    BATCH_SIZE = 6          # Mini-batch size for each gradient update
+    BATCH_SIZE = 32          # Mini-batch size for each gradient update
     N_EPOCHS = 4            # How many times to loop over the collected data
     LEARNING_RATE = 3e-5    # Learning rate
-    N_ENVS = 25              # Number of parallel environments
+    N_ENVS = 64              # Number of parallel environments
     FRAME_SKIP = 5          # Frame skip value
     N_STACK = 4             # Number of frames to stack for the CNN
 
@@ -59,7 +59,7 @@ if __name__ == "__main__":
 
     # --- Setup Configuration ---
     DEVICE = 'cuda:2'       # Match the device from your script
-    LOGDIR = './ppo_car_cnn_baseline_subproc/' # A separate log directory for the baseline
+    LOGDIR = './runs/ppo_car_cnn_baseline_subproc_50/' # A separate log directory for the baseline
 
     # ==============================================================================
     #  3. ENVIRONMENT SETUP

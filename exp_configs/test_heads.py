@@ -23,7 +23,7 @@ MAX_SIM_STEPS=300
 # PPO hyperparameters
 ppo = dict(
     n_steps=128,
-    batch_size=6,
+    batch_size=8,
     n_epochs=1,
     gamma=0.9,
     ent_coef=0.0,
